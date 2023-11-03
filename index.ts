@@ -8,7 +8,7 @@ import type {
     ManifestChunk,
     Plugin,
     ResolvedConfig,
-    UserConfig,
+    UserConfig
 } from 'vite'
 import { globbySync } from 'globby'
 
@@ -120,6 +120,15 @@ export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
         return $.html()
     }
 
+    function parseTargetDirectory(inputPath: string): string {
+        return path.basename(path.dirname(inputPath))
+    }
+
+    function buildDirectoryCreationRequired(buildDirectory: string, resolvedInputs: string[]): boolean {
+        const basename = path.basename(buildDirectory);
+        return resolvedInputs.some(inputPath => parseTargetDirectory(inputPath) === basename);
+    }
+
     // for each input (graphics & dashboard panels) create an html doc and emit to disk
     function generateHTMLFiles() {
         let resolvedInputs: string[]
@@ -142,8 +151,12 @@ export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
         if (fs.existsSync(dashboardDir))
             fs.rmSync(dashboardDir, { recursive: true, force: true })
 
-        fs.mkdirSync(graphicsDir)
-        fs.mkdirSync(dashboardDir)
+        if (buildDirectoryCreationRequired(graphicsDir, resolvedInputs)) {
+            fs.mkdirSync(graphicsDir)
+        }
+        if (buildDirectoryCreationRequired(dashboardDir, resolvedInputs)) {
+            fs.mkdirSync(dashboardDir)
+        }
 
         const htmlDocs = {} as { [key: string]: string }
 
@@ -171,7 +184,7 @@ export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
                 inputPath.replace(/^(\.\/)/, '')
             )
 
-            const dirname = path.basename(path.dirname(inputPath))
+            const dirname = parseTargetDirectory(inputPath)
             const name = path.basename(inputPath, path.extname(inputPath))
 
             htmlDocs[`${dirname}/${name}.html`] = html
@@ -193,7 +206,7 @@ export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
                 typeof _config?.server?.host === 'string'
                     ? _config?.server?.host
                     : 'localhost'
-            }:${_config?.server?.port?.toString() ?? '3000'}`
+            }:${_config?.server?.port?.toString() ?? '5173'}`
 
             return {
                 build: {
