@@ -3,12 +3,16 @@ export interface PluginConfig {
     /** Use to map input files to template paths
      *
      * @default {
-        './src/graphics/*.ts': './src/graphics/template.html',
-        './src/dashboard/*.ts': './src/dashboard/template.html',
+        'graphics/*.{js,ts}': './src/graphics/template.html',
+        'dashboard/*.{js,ts}': './src/dashboard/template.html',
     }
     */
-    inputs: {
+    inputs?: {
         [key: string]: string;
-    };
+    } | undefined;
+    /** Base directory for input-file paths
+     * @default './src'
+     */
+    srcDir?: string | undefined;
 }
 export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin;
