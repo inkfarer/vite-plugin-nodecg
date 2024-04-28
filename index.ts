@@ -1,7 +1,9 @@
-import * as cheerio from 'cheerio'
 import fs from 'fs'
 import path from 'path'
+
 import { minimatch } from 'minimatch'
+import { globbySync } from 'globby'
+
 import type { InputOptions } from 'rollup'
 import type {
     Manifest,
@@ -10,70 +12,92 @@ import type {
     ResolvedConfig,
     UserConfig
 } from 'vite'
-import { globbySync } from 'globby'
 
 export interface PluginConfig {
     /** Use to map input files to template paths 
      * 
      * @default {
-        './src/graphics/*.ts': './src/graphics/template.html',
-        './src/dashboard/*.ts': './src/dashboard/template.html',
+        'graphics/*.{js,ts}': './src/graphics/template.html',
+        'dashboard/*.{js,ts}': './src/dashboard/template.html',
     }
     */
-    inputs: { [key: string]: string }
+    inputs?: { [key: string]: string } | undefined
+
+    /** Base directory for input-file paths
+     * @default './src'
+     */
+    srcDir?: string | undefined
 }
 
 export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
     const bundleName = path.basename(process.cwd())
 
     const inputConfig = pluginConfig?.inputs ?? {
-        './src/graphics/*.{js,ts}': './src/graphics/template.html',
-        './src/dashboard/*.{js,ts}': './src/dashboard/template.html',
+        'graphics/*.{js,ts}': './src/graphics/template.html',
+        'dashboard/*.{js,ts}': './src/dashboard/template.html',
     }
 
+    const srcDir = pluginConfig?.srcDir ?? './src'
+
+    const inputPatterns = [
+        ...Object.keys(inputConfig).map((matchPath) =>
+            path.posix.join(srcDir, matchPath)
+        ),
+        '!**.d.ts',
+    ]
+
     // string array of paths to all input files (always ignore ts declaration files)
-    const inputs = globbySync([...Object.keys(inputConfig), '!**.d.ts'])
+    const inputs = globbySync(inputPatterns)
+
+    if (!inputs || !inputs.length) {
+        console.error('vite-plugin-nodecg: No inputs were found! Exiting')
+        process.exit(1)
+    } else {
+        console.log('vite-plugin-nodecg: Found the following inputs: ', inputs)
+    }
 
     // now we know which inputs actually exist, lets clean up unused inputConfig entries so we don't load templates we don't need
     // useful in the case the default inputsConfig is used, but the nodecg bundle has only dashboards or only graphics (or no inputs at all)
     Object.keys(inputConfig).forEach((matchPath) => {
-        if (!inputs.some((input) => minimatch(input, matchPath)))
+        if (
+            !inputs.some((input) =>
+                minimatch(input, path.posix.join(srcDir, matchPath))
+            )
+        )
             delete inputConfig[matchPath]
     })
 
-    console.log('vite-plugin-nodecg: Found the following inputs: ', inputs)
-
     // map from template paths to file buffers
-    const templates = {} as { [key: string]: Buffer }
+    const templates = {} as { [key: string]: string }
     Object.values(inputConfig).forEach((templatePath) => {
         if (templates[templatePath]) return // skip if already read
-        const fullPath = path.join(process.cwd(), templatePath)
-        templates[templatePath] = fs.readFileSync(fullPath)
+        const fullPath = path.posix.join(process.cwd(), templatePath)
+        templates[templatePath] = fs.readFileSync(fullPath, 'utf-8')
     })
 
     let config: ResolvedConfig
+    let dSrvProtocol: string
+    let dSrvHost: string
     let assetManifest: Manifest
-    let protocol: string
-    let socketAddr: string
 
     let resolvedInputOptions: InputOptions
 
     // take the template html and inject script and css assets into <head>
-    function injectAssetsTags(html: string | Buffer, entry: string) {
-        const $ = cheerio.load(html)
-
+    function injectAssetsTags(html: string, entry: string) {
         const tags = []
 
         if (config.mode === 'development') {
             tags.push(
-                `<script type="module" src="${protocol}://${path.join(
-                    socketAddr,
+                `<script type="module" src="${dSrvProtocol}://${path.posix.join(
+                    dSrvHost,
+                    'bundles',
+                    bundleName,
                     '@vite/client'
                 )}"></script>`
             )
             tags.push(
-                `<script type="module" src="${protocol}://${path.join(
-                    socketAddr,
+                `<script type="module" src="${dSrvProtocol}://${path.posix.join(
+                    dSrvHost,
                     'bundles',
                     bundleName,
                     entry
@@ -90,7 +114,7 @@ export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
                     if (alreadyProcessed.includes(cssPath)) return // de-dupe assets
 
                     tags.push(
-                        `<link rel="stylesheet" href="${path.join(
+                        `<link rel="stylesheet" href="${path.posix.join(
                             config.base,
                             cssPath
                         )}" />`
@@ -108,16 +132,18 @@ export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
             generateCssTags(entryChunk)
 
             tags.push(
-                `<script type="module" src="${path.join(
+                `<script type="module" src="${path.posix.join(
                     config.base,
                     entryChunk.file
                 )}"></script>`
             )
         }
 
-        $('head').append(tags.join('\n'))
+        const newHtml = html.includes('</head>')
+            ? html.replace('</head>', tags.join('\n') + '\n</head>')
+            : tags.join('\n') + '\n' + html
 
-        return $.html()
+        return newHtml
     }
 
     function parseTargetDirectory(inputPath: string): string {
@@ -142,29 +168,13 @@ export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
             resolvedInputs = Object.values(resolvedInputOptions.input)
         }
 
-        const graphicsDir = path.join(process.cwd(), 'graphics')
-        const dashboardDir = path.join(process.cwd(), 'dashboard')
-
-        // clear build directories
-        if (fs.existsSync(graphicsDir))
-            fs.rmSync(graphicsDir, { recursive: true, force: true })
-        if (fs.existsSync(dashboardDir))
-            fs.rmSync(dashboardDir, { recursive: true, force: true })
-
-        if (buildDirectoryCreationRequired(graphicsDir, resolvedInputs)) {
-            fs.mkdirSync(graphicsDir)
-        }
-        if (buildDirectoryCreationRequired(dashboardDir, resolvedInputs)) {
-            fs.mkdirSync(dashboardDir)
-        }
-
         const htmlDocs = {} as { [key: string]: string }
 
         // generate string html for each input
         resolvedInputs.forEach((inputPath) => {
             // find first template that has a match path that this input satisfies
             const matchPath = Object.keys(inputConfig).find((matchPath) => {
-                return minimatch(inputPath, matchPath)
+                return minimatch(inputPath, path.posix.join(srcDir, matchPath))
             })
 
             const templatePath = inputConfig[matchPath]
@@ -184,15 +194,32 @@ export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
                 inputPath.replace(/^(\.\/)/, '')
             )
 
-            const dirname = parseTargetDirectory(inputPath)
+            const buildDir = path.dirname(path.relative(srcDir, inputPath))
             const name = path.basename(inputPath, path.extname(inputPath))
+            const filePath = path.join(buildDir, `${name}.html`)
 
-            htmlDocs[`${dirname}/${name}.html`] = html
+            htmlDocs[filePath] = html
         })
 
         // write each html doc to disk
         for (const [filePath, htmlDoc] of Object.entries(htmlDocs)) {
-            fs.writeFileSync(path.join(process.cwd(), filePath), htmlDoc)
+            const fullFilePath = path.join(process.cwd(), filePath)
+            const dir = path.dirname(fullFilePath)
+
+            try {
+                fs.mkdirSync(dir, { recursive: true })
+            } catch (e) {
+                console.error(
+                    `vite-plugin-nodecg: Could not create directory ${dir} for input ${filePath}. Skipping...`
+                )
+                continue
+            }
+
+            fs.writeFile(fullFilePath, htmlDoc, () => {
+                console.log(
+                    `vite-plugin-nodecg: Wrote input ${filePath} to disk`
+                )
+            })
         }
     }
 
@@ -201,23 +228,13 @@ export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
 
         // validate and setup defaults in user's vite config
         config: (_config, { mode }): UserConfig => {
-            protocol = _config?.server?.https ? 'https' : 'http'
-            socketAddr = `${
-                typeof _config?.server?.host === 'string'
-                    ? _config?.server?.host
-                    : 'localhost'
-            }:${_config?.server?.port?.toString() ?? '5173'}`
-
             return {
                 build: {
-                    manifest: true,
+                    manifest: 'manifest.json',
                     outDir: 'shared/dist',
                     rollupOptions: {
                         input: inputs,
                     },
-                },
-                server: {
-                    origin: `${protocol}://${socketAddr}`,
                 },
                 base: `/bundles/${bundleName}/${
                     mode === 'development' ? '' : 'shared/dist/'
@@ -233,12 +250,6 @@ export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
         buildStart(options: InputOptions) {
             // capture inputOptions for use in generateHtmlFiles in both dev & prod
             resolvedInputOptions = options
-
-            if (!resolvedInputOptions?.input || config.mode !== 'development')
-                return
-
-            // dev inject
-            generateHTMLFiles()
         },
 
         writeBundle() {
@@ -251,7 +262,7 @@ export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
                 assetManifest = JSON.parse(
                     fs
                         .readFileSync(
-                            path.join(
+                            path.posix.join(
                                 process.cwd(),
                                 config.build.outDir,
                                 'manifest.json'
@@ -268,6 +279,21 @@ export default function viteNodeCGPlugin(pluginConfig: PluginConfig): Plugin {
 
             // prod inject
             generateHTMLFiles()
+        },
+
+        configureServer(server) {
+            server.httpServer.on('listening', () => {
+                dSrvProtocol = server.config.server.https ? 'https' : 'http'
+                dSrvHost = `${server.config.server.host ?? 'localhost'}:${
+                    server.config.server.port ?? '5173'
+                }`
+
+                // fix dev server origin
+                server.config.server.origin = `${dSrvProtocol}://${dSrvHost}`
+
+                // dev inject
+                generateHTMLFiles()
+            })
         },
     }
 }
